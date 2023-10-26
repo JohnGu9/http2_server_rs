@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::{Future, SinkExt};
 use http_body_util::StreamBody;
-use hyper::body::Frame;
+use hyper::body::{Frame, Incoming};
 use hyper::header::{self, HeaderValue};
 use hyper::upgrade::Upgraded;
 use hyper::{
@@ -18,6 +18,7 @@ use hyper::{
 use hyper::{Method, Response, StatusCode, Version};
 use hyper_util::rt::TokioIo;
 use tls::{load_certs, load_keys};
+use tokio::net::TcpStream;
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 use tokio_tungstenite::{tungstenite, WebSocketStream};
 
@@ -25,55 +26,63 @@ pub type ResponseUnit = Result<Frame<Bytes>, Box<dyn std::error::Error + Send + 
 pub type ResponseType = Response<StreamBody<mpsc::Receiver<ResponseUnit>>>;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let certs = load_certs()?;
-    let mut keys = load_keys()?;
+async fn main() {
+    let listener = tokio::net::TcpListener::bind("localhost:7200")
+        .await
+        .unwrap();
+
+    let certs = load_certs().expect("No available ssl cert");
+    let mut keys = load_keys().expect("No available ssl key");
 
     let mut config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(certs, keys.pop().unwrap())?;
+        .with_single_cert(certs, keys.pop().expect("No available ssl key"))
+        .unwrap();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
     let config = Arc::new(config);
     let acceptor = TlsAcceptor::from(config.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:7200").await?;
-    println!("listen on https://127.0.0.1:7200");
+    println!("listen on https://{:?}", listener.local_addr().unwrap());
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                if let Ok(stream) = acceptor.accept(stream).await {
-                    let (_, session) = stream.get_ref();
-                    let is_h2 = match session.alpn_protocol() {
-                        Some(alpn) => alpn == b"h2",
-                        None => false,
-                    };
-                    let io = TokioIo::new(stream);
-                    let res = match is_h2 {
-                        true => {
-                            println!("h2 from {}", addr);
-                            http2::Builder::new(TokioExecutor)
-                                .serve_connection(io, service_fn(on_http))
-                                .await
-                        }
-                        false => {
-                            println!("h1 from {}", addr);
-                            let handle = |req| http_websocket_classify(addr, req);
-                            http1::Builder::new()
-                                .serve_connection(io, service_fn(handle))
-                                .with_upgrades()
-                                .await
-                        }
-                    };
-                    if let Err(e) = res {
-                        println!("Error: {:?}", e);
-                    }
-                }
+                tokio::spawn(handle_connection(stream, addr, acceptor.clone()));
             }
-            Err(e) => {
+            Err(e) => println!("Error: {:?}", e),
+        }
+    }
+}
+
+async fn handle_connection(stream: TcpStream, addr: SocketAddr, acceptor: TlsAcceptor) {
+    match acceptor.accept(stream).await {
+        Ok(stream) => {
+            let (_, session) = stream.get_ref();
+            let is_h2 = match session.alpn_protocol() {
+                Some(alpn) => alpn == b"h2",
+                None => false,
+            };
+            let stream = TokioIo::new(stream);
+            let res = if is_h2 {
+                println!("h2 from {}", addr);
+                http2::Builder::new(TokioExecutor)
+                    .serve_connection(stream, service_fn(on_http))
+                    .await
+            } else {
+                println!("h1 from {}", addr);
+                let handle = |req| http_websocket_classify(addr, req);
+                http1::Builder::new()
+                    .serve_connection(stream, service_fn(handle))
+                    .with_upgrades()
+                    .await
+            };
+            if let Err(e) = res {
                 println!("Error: {:?}", e);
             }
+        }
+        Err(e) => {
+            println!("SSL handshake error: {:?}", e);
         }
     }
 }
@@ -93,7 +102,7 @@ where
 
 async fn http_websocket_classify(
     addr: SocketAddr,
-    req: Request<hyper::body::Incoming>,
+    req: Request<Incoming>,
 ) -> Result<ResponseType, Infallible> {
     const UPGRADE_HEADER_VALUE: HeaderValue = HeaderValue::from_static("Upgrade");
     const WEBSOCKET_HEADER_VALUE: HeaderValue = HeaderValue::from_static("websocket");
@@ -123,12 +132,10 @@ async fn http_websocket_classify(
                         .map(|h| h == "13")
                         .unwrap_or(false)
                 {
-                    let ver = req.version();
-                    let (mut tx, rx) = mpsc::channel(1);
-                    tx.close_channel();
+                    let (_, rx) = mpsc::channel(1);
                     let mut res = Response::new(StreamBody::new(rx));
                     *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-                    *res.version_mut() = ver;
+                    *res.version_mut() = req.version();
                     let headers = res.headers_mut();
                     headers.append(header::CONNECTION, UPGRADE_HEADER_VALUE);
                     headers.append(header::UPGRADE, WEBSOCKET_HEADER_VALUE);
@@ -147,7 +154,7 @@ async fn http_websocket_classify(
     return on_http(req).await;
 }
 
-async fn upgrade_web_socket(addr: SocketAddr, mut req: Request<hyper::body::Incoming>) {
+async fn upgrade_web_socket(addr: SocketAddr, mut req: Request<Incoming>) {
     match hyper::upgrade::on(&mut req).await {
         Ok(upgraded) => {
             let upgraded = TokioIo::new(upgraded);
@@ -170,14 +177,14 @@ async fn upgrade_web_socket(addr: SocketAddr, mut req: Request<hyper::body::Inco
 }
 
 async fn on_websocket(
-    _: Request<hyper::body::Incoming>,
+    _: Request<Incoming>,
     _: WebSocketStream<TokioIo<Upgraded>>,
 ) -> Result<(), Box<dyn Error>> {
     /* websocket handle */
     Ok(())
 }
 
-async fn on_http(_: Request<hyper::body::Incoming>) -> Result<ResponseType, Infallible> {
+async fn on_http(_: Request<Incoming>) -> Result<ResponseType, Infallible> {
     /* http handle */
     let (mut tx, rx) = mpsc::channel(0);
     tokio::spawn(async move {
